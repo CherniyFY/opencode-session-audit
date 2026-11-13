@@ -1,0 +1,15 @@
+{
+  "name": "opencode-session-audit",
+  "version": "0.1.0",
+  "description": "Read-only command-line views of an opencode session database",
+  "license": "MIT",
+  "bin": {
+    "opencode-session-audit": "opencode-session-audit"
+  },
+  "scripts": {
+    "test": "node test/run.cjs"
+  },
+  "engines": {
+    "node": ">=22.13"
+  }
+}

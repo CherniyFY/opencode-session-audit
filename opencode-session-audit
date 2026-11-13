@@ -1,0 +1,245 @@
+#!/usr/bin/env node
+"use strict";
+
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const sqlite = require("node:sqlite");
+
+const Database = sqlite.Database ?? sqlite.DatabaseSync;
+
+const FILE_TOOLS = ["write", "edit"];
+const SHELL_TOOLS = ["bash", "shell"];
+const REQUIRED_TABLES = ["session_v2", "session_message"];
+
+const USAGE = `usage: opencode-session-audit [--db PATH] <command> [options] [SESSION]
+
+commands:
+  sessions [--dir DIR] [--limit N]   list sessions, newest first
+  tools [SESSION]                    count tool calls by tool name
+  files [--tool NAME] [SESSION]      files written or edited by file tools
+  shell [--match REGEX] [SESSION]    shell commands run by sessions
+  query SQL                          run SELECT/WITH SQL, print rows as JSON
+
+SESSION is a session id or a unique prefix of one.
+Database: --db PATH, else $OPENCODE_DB, else $XDG_DATA_HOME/opencode/opencode.db.
+`;
+
+class UsageError extends Error {}
+
+function parseArgs(argv) {
+  const opts = { positional: [] };
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === "-h" || arg === "--help") {
+      opts.help = true;
+    } else if (["--db", "--dir", "--limit", "--tool", "--match"].includes(arg)) {
+      if (i + 1 >= argv.length) throw new UsageError(`${arg} needs a value`);
+      opts[arg.slice(2)] = argv[++i];
+    } else if (arg.startsWith("-")) {
+      throw new UsageError(`unknown option ${arg}`);
+    } else {
+      opts.positional.push(arg);
+    }
+  }
+  return opts;
+}
+
+function defaultDatabase() {
+  if (process.env.OPENCODE_DB) return process.env.OPENCODE_DB;
+  const dataHome = process.env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share");
+  return path.join(dataHome, "opencode", "opencode.db");
+}
+
+function openDatabase(file) {
+  if (!fs.existsSync(file)) throw new Error(`no database at ${file}`);
+  const db = new Database(file, { readOnly: true });
+  db.exec("PRAGMA query_only = ON");
+  const tables = new Set(
+    db
+      .prepare("select name from sqlite_master where type = 'table'")
+      .all()
+      .map((row) => row.name),
+  );
+  const missing = REQUIRED_TABLES.filter((name) => !tables.has(name));
+  if (missing.length > 0) {
+    db.close();
+    throw new Error(`${file} is not a supported opencode database (missing ${missing.join(", ")})`);
+  }
+  return db;
+}
+
+function resolveSession(db, ref) {
+  if (ref === undefined) return undefined;
+  const rows = db.prepare("select id from session_v2 where substr(id, 1, length(?)) = ?").all(ref, ref);
+  if (rows.length === 0) throw new Error(`no session starts with ${ref}`);
+  if (rows.length > 1) throw new Error(`${ref} matches ${rows.length} sessions, use a longer prefix`);
+  return rows[0].id;
+}
+
+function* toolCalls(db, sessionId) {
+  const rows = db
+    .prepare(
+      `select m.session_id, s.title, m.data
+       from session_message m
+       join session_v2 s on s.id = m.session_id
+       where m.type = 'assistant' and (? is null or m.session_id = ?)
+       order by m.session_id, m.seq`,
+    )
+    .all(sessionId ?? null, sessionId ?? null);
+  for (const row of rows) {
+    let message;
+    try {
+      message = JSON.parse(row.data);
+    } catch {
+      continue;
+    }
+    const content = Array.isArray(message?.content) ? message.content : [];
+    for (const part of content) {
+      if (part?.type !== "tool") continue;
+      yield {
+        session: row.session_id,
+        title: row.title ?? row.session_id,
+        tool: part.name,
+        input: part.state?.input ?? {},
+      };
+    }
+  }
+}
+
+function field(text, max = 300) {
+  const flat = String(text).replace(/\s*\n\s*/g, " | ").replace(/\t/g, " ");
+  return flat.length > max ? `${flat.slice(0, max)}...` : flat;
+}
+
+function isoMinute(ms) {
+  return new Date(ms).toISOString().slice(0, 16).replace("T", " ");
+}
+
+function expectArgs(args, max) {
+  if (args.length > max) throw new UsageError(`unexpected argument ${args[max]}`);
+}
+
+function parseLimit(value = "50") {
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 1) throw new UsageError("--limit needs a positive integer");
+  return n;
+}
+
+function cmdSessions(db, opts, args) {
+  expectArgs(args, 0);
+  const limit = parseLimit(opts.limit);
+  const columns = "select id, directory, title, time_created from session_v2";
+  const rows =
+    opts.dir === undefined
+      ? db.prepare(`${columns} order by time_created desc limit ?`).all(limit)
+      : db.prepare(`${columns} where directory = ? order by time_created desc limit ?`).all(opts.dir, limit);
+  for (const row of rows) {
+    console.log([isoMinute(row.time_created), row.id, field(row.directory), field(row.title ?? "")].join("\t"));
+  }
+}
+
+function cmdTools(db, opts, args) {
+  expectArgs(args, 1);
+  const session = resolveSession(db, args[0]);
+  const counts = new Map();
+  for (const call of toolCalls(db, session)) {
+    counts.set(call.tool, (counts.get(call.tool) ?? 0) + 1);
+  }
+  const sorted = [...counts].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  for (const [tool, count] of sorted) {
+    console.log(`${count}\t${tool}`);
+  }
+}
+
+function cmdFiles(db, opts, args) {
+  expectArgs(args, 1);
+  const session = resolveSession(db, args[0]);
+  const tools = opts.tool === undefined ? FILE_TOOLS : [opts.tool];
+  const edits = new Map();
+  for (const call of toolCalls(db, session)) {
+    const file = call.input.filePath ?? call.input.path;
+    if (!tools.includes(call.tool) || typeof file !== "string") continue;
+    const key = `${call.session}\t${call.tool}\t${file}`;
+    const edit = edits.get(key) ?? { count: 0, title: call.title, tool: call.tool, file };
+    edit.count += 1;
+    edits.set(key, edit);
+  }
+  for (const { count, title, tool, file } of edits.values()) {
+    console.log(`${count}\t${field(title)}\t${tool}\t${field(file)}`);
+  }
+}
+
+function cmdShell(db, opts, args) {
+  expectArgs(args, 1);
+  const session = resolveSession(db, args[0]);
+  const pattern = opts.match === undefined ? undefined : new RegExp(opts.match);
+  for (const call of toolCalls(db, session)) {
+    const command = call.input.command;
+    if (!SHELL_TOOLS.includes(call.tool) || typeof command !== "string") continue;
+    if (pattern !== undefined && !pattern.test(command)) continue;
+    console.log(`${field(call.title)}\t${field(command)}`);
+  }
+}
+
+function cmdQuery(db, opts, args) {
+  if (args.length === 0) throw new UsageError("query needs SQL");
+  const sql = args.join(" ");
+  let statement = sql.trimStart();
+  while (statement.startsWith("--") || statement.startsWith("/*")) {
+    if (statement.startsWith("--")) {
+      const end = statement.indexOf("\n");
+      statement = end === -1 ? "" : statement.slice(end + 1).trimStart();
+    } else {
+      const end = statement.indexOf("*/", 2);
+      if (end === -1) throw new UsageError("query has an unterminated comment");
+      statement = statement.slice(end + 2).trimStart();
+    }
+  }
+  // A read-only connection can still create files through VACUUM INTO. Reject
+  // those commands before preparing them, and never expose a PRAGMA that could
+  // turn query_only off. query_only also rejects WITH-prefixed write statements.
+  const keyword = /^[A-Za-z_][A-Za-z0-9_]*/.exec(statement)?.[0].toUpperCase();
+  if (keyword !== "SELECT" && keyword !== "WITH") {
+    throw new UsageError("read-only queries must start with SELECT or WITH");
+  }
+  console.log(JSON.stringify(db.prepare(sql).all(), null, 2));
+}
+
+const COMMANDS = {
+  sessions: cmdSessions,
+  tools: cmdTools,
+  files: cmdFiles,
+  shell: cmdShell,
+  query: cmdQuery,
+};
+
+function main(argv) {
+  const opts = parseArgs(argv);
+  if (opts.help) {
+    process.stdout.write(USAGE);
+    return 0;
+  }
+  const [command, ...args] = opts.positional;
+  if (command === undefined) throw new UsageError("no command given");
+  if (!Object.hasOwn(COMMANDS, command)) throw new UsageError(`unknown command ${command}`);
+  const db = openDatabase(opts.db ?? defaultDatabase());
+  try {
+    COMMANDS[command](db, opts, args);
+  } finally {
+    db.close();
+  }
+  return 0;
+}
+
+try {
+  process.exitCode = main(process.argv.slice(2));
+} catch (error) {
+  if (error instanceof UsageError) {
+    process.stderr.write(`opencode-session-audit: ${error.message}\n\n${USAGE}`);
+    process.exitCode = 2;
+  } else {
+    process.stderr.write(`opencode-session-audit: ${error.message}\n`);
+    process.exitCode = 1;
+  }
+}
